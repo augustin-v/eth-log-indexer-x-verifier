@@ -1,0 +1,12 @@
+[package]
+name = "eth-log-indexer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy = "1.0.23"
+dotenv = "0.15.0"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+tokio = { version = "1.46.1", features= ["macros", "rt-multi-thread"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
