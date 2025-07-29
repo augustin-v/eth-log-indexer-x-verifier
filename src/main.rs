@@ -1,11 +1,12 @@
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::eth::{Filter, Log, BlockNumberOrTag};
 use alloy::primitives::Address;
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::eth::{BlockNumberOrTag, Filter, Log};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
-use rusqlite::{Connection, params, Transaction};
-use tracing::{debug, error, info};
+use clap::{Parser, Subcommand, ValueEnum};
+use rusqlite::{Connection, Transaction, params, params_from_iter};
 use std::time::Duration;
+use tracing::{debug, error, info};
 
 sol! {
     #[derive(Debug)]
@@ -21,16 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = dotenv::dotenv() {
         error!("Failed to load .env file: {}", e);
     }
-    let erc20_address: Address = dotenv::var("ERC20_ADDRESS")?.parse()?;
-    let rpc_url = dotenv::var("RPC")?.parse()?;
+    let config = Config::from_env();
+    let cli = Cli::parse();
 
-    info!("Connecting to HTTP RPC: {}", rpc_url);
-    debug!("ERC-20 address: {}", erc20_address);
-
-    let provider = ProviderBuilder::new().connect_http(rpc_url);
-
-    let chain_id = provider.get_chain_id().await?;
-    info!("Successfully connected to chain ID: {}", chain_id);
+    info!(
+        "Starting Ethereum Log Indexer with command: {:?}",
+        cli.command
+    );
 
     let mut db_conn = Connection::open("transfers.db")?;
     db_conn.execute(
@@ -46,20 +44,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )",
         params![],
     )?;
+    db_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_block ON transfers (block_number)",
+        params![],
+    )?;
+    db_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_from ON transfers (from_addr)",
+        params![],
+    )?;
+    db_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_to ON transfers (to_addr)",
+        params![],
+    )?;
 
-    let filter = Filter::new()
-        .address(erc20_address)
-        .event("Transfer(address,address,uint256)");
+    match cli.command {
+        Commands::Index {
+            finality,
+            poll_interval,
+            range,
+        } => {
+            let rpc_url = config.rpc.parse()?;
+            let erc20_address: Address = config.erc20.parse()?;
 
-    let use_range = true;
+            info!("Connecting to HTTP RPC: {}", config.rpc);
+            debug!("ERC-20 address: {}", erc20_address);
 
-    // finalized blocks
-    let range_from = 23003243_u64;
-    let range_to = 23003247_u64;
-    let finality_mode = FinalityMode::Finalized;
-    let poll_interval_secs = 10u64;
+            let provider = ProviderBuilder::new().connect_http(rpc_url);
 
-    poll_and_index(&provider, &filter, &mut db_conn, finality_mode, poll_interval_secs, use_range, Some(range_from), Some(range_to)).await?;
+            let chain_id = provider.get_chain_id().await?;
+            let latest_block = provider.get_block_number().await?;
+            info!("Successfully connected to chain ID: {}", chain_id);
+            debug!("Current latest block: {}", latest_block);
+
+            let filter = Filter::new()
+                .address(erc20_address)
+                .event("Transfer(address,address,uint256)");
+
+            info!("Starting indexing with filter: {:?}", filter);
+
+            let (range_from, range_to) = match range {
+                Some(vec) if vec.len() == 2 => (Some(vec[0]), Some(vec[1])),
+                Some(_) => {
+                    error!("Invalid range: exactly two values required");
+                    return Ok(());
+                }
+                None => (None, None),
+            };
+            poll_and_index(
+                &provider,
+                &filter,
+                &mut db_conn,
+                finality,
+                poll_interval,
+                range_from,
+                range_to,
+            )
+            .await?;
+        }
+        Commands::Query { tx_hash, from_addr } => {
+            if tx_hash.is_none() && from_addr.is_none() {
+                info!("Please provide --tx-hash or --from-addr for querying.");
+                return Ok(());
+            }
+
+            let mut query = "SELECT * FROM transfers WHERE 1=1".to_string();
+            let mut params_vec: Vec<String> = vec![];
+
+            if let Some(hash) = tx_hash {
+                query.push_str(" AND tx_hash = ?");
+                params_vec.push(hash);
+            }
+            if let Some(addr) = from_addr {
+                query.push_str(" AND from_addr = ?");
+                params_vec.push(addr);
+            }
+
+            info!("Querying transfers with: {}", query);
+            let mut stmt = db_conn.prepare(&query)?;
+            let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                found = true;
+                let tx_hash: String = row.get(0)?;
+                let from: String = row.get(2)?;
+                let to: String = row.get(3)?;
+                let value: String = row.get(4)?;
+                let block: u64 = row.get(5)?;
+                info!(
+                    "Transfer in tx {}: {} -> {} (value: {}) in block {}",
+                    tx_hash, from, to, value, block
+                );
+            }
+            if !found {
+                info!("No transfers found matching the query.");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -70,16 +150,28 @@ async fn poll_and_index(
     db_conn: &mut Connection,
     finality_mode: FinalityMode,
     poll_interval_secs: u64,
-    use_range: bool,
     range_from: Option<u64>,
     range_to: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_indexed: u64 = get_last_indexed_block(db_conn)?.unwrap_or(0);
+    let use_range = range_from.is_some() && range_to.is_some();
     loop {
         let latest = provider.get_block_number().await?;
-        let finalized_block = provider.get_block(BlockNumberOrTag::Finalized.into()).await?.ok_or("Failed to get finalized block")?.header.number;
+        let finalized_block = provider
+            .get_block(BlockNumberOrTag::Finalized.into())
+            .await?
+            .ok_or("Failed to get finalized block")?
+            .header
+            .number;
         let mut end_block = match finality_mode {
-            FinalityMode::Safe => provider.get_block(BlockNumberOrTag::Safe.into()).await?.ok_or("Failed to get safe block")?.header.number,
+            FinalityMode::Safe => {
+                provider
+                    .get_block(BlockNumberOrTag::Safe.into())
+                    .await?
+                    .ok_or("Failed to get safe block")?
+                    .header
+                    .number
+            }
             FinalityMode::Finalized => finalized_block,
             FinalityMode::None => latest,
         };
@@ -87,15 +179,18 @@ async fn poll_and_index(
         let mut current = last_indexed + 1;
 
         if use_range {
-            if let (Some(start), Some(end)) = (range_from, range_to) {
-                if start > end || start > latest {
-                    error!("Invalid range: start={} > end={} or exceeds latest={}", start, end, latest);
-                    return Ok(());
-                }
-                current = start;
-                end_block = end;
-                info!("Indexing range: {} to {}", current, end_block);
+            let start = range_from.unwrap();
+            let end = range_to.unwrap();
+            if start > end || start > latest {
+                error!(
+                    "Invalid range: start={} > end={} or exceeds latest={}",
+                    start, end, latest
+                );
+                return Ok(());
             }
+            current = start;
+            end_block = end;
+            info!("Indexing specified range: {} to {}", current, end_block);
         }
 
         if current <= end_block {
@@ -106,7 +201,9 @@ async fn poll_and_index(
                 let logs = provider.get_logs(&batch_filter).await?;
                 let mut tx = db_conn.transaction()?;
                 for log in logs {
-                    if let Err(e) = process_log(&log, &mut tx, provider, finality_mode.clone()).await {
+                    if let Err(e) =
+                        process_log(&log, &mut tx, provider, finality_mode.clone()).await
+                    {
                         error!("Log processing error: {}", e);
                     }
                 }
@@ -117,14 +214,20 @@ async fn poll_and_index(
             last_indexed = end_block;
             check_for_reorgs(provider, db_conn, finalized_block).await?;
         } else {
-            info!("Up to date at block {}; no new blocks to index", last_indexed);
+            info!(
+                "Up to date at block {}; no new blocks to index",
+                last_indexed
+            );
         }
 
         if use_range {
             info!("Range indexing complete; exiting.");
             break;
         }
-        info!("Polling complete; sleeping for {} seconds", poll_interval_secs);
+        info!(
+            "Polling complete; sleeping for {} seconds",
+            poll_interval_secs
+        );
         tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
     }
     Ok(())
@@ -145,25 +248,35 @@ async fn process_log(
                     let value = decoded.data().value;
                     debug!("Decoded: from={}, to={}, value={}", from, to, value);
 
-                    if let (Some(block_num), Some(block_hash), Some(tx_hash), Some(log_index)) = 
-                        (log.block_number, log.block_hash, log.transaction_hash, log.log_index) {
-                        
+                    if let (Some(block_num), Some(block_hash), Some(tx_hash), Some(log_index)) = (
+                        log.block_number,
+                        log.block_hash,
+                        log.transaction_hash,
+                        log.log_index,
+                    ) {
+                        // finality check
                         if finality_mode != FinalityMode::None {
                             let tag = match finality_mode {
                                 FinalityMode::Safe => BlockNumberOrTag::Safe,
                                 FinalityMode::Finalized => BlockNumberOrTag::Finalized,
                                 _ => BlockNumberOrTag::Finalized,
                             };
-                            let check_block = provider.get_block(tag.into()).await?.ok_or("Failed to fetch block")?;
+                            let check_block = provider
+                                .get_block(tag.into())
+                                .await?
+                                .ok_or("Failed to fetch block")?;
                             let check_num = check_block.header.number;
 
                             if block_num > check_num {
-                                info!("Skipping log in block {} ({:?}: {}) - not finalized yet", block_num, finality_mode, check_num);
+                                info!(
+                                    "Skipping log in block {} ({:?}: {}) - not finalized yet",
+                                    block_num, finality_mode, check_num
+                                );
                                 return Ok(());
                             }
                         }
 
-                        tx.execute(
+                        match tx.execute(
                             "INSERT OR IGNORE INTO transfers (tx_hash, log_index, from_addr, to_addr, value, block_number, block_hash)
                              VALUES (?, ?, ?, ?, ?, ?, ?)",
                             params![
@@ -175,8 +288,11 @@ async fn process_log(
                                 block_num,
                                 block_hash.to_string()
                             ],
-                        )?;
-                        info!("Stored Transfer (tx: {}): {} -> {} (value: {}) in block {}", tx_hash, from, to, value, block_num);
+                        ) {
+                            Ok(0) => debug!("Log already exists (tx: {}, index: {}) - skipped", tx_hash, log_index),
+                            Ok(_) => info!("Stored Transfer (tx: {}): {} -> {} (value: {}) in block {}", tx_hash, from, to, value, block_num),
+                            Err(e) => error!("Failed to store transfer: {}", e),
+                        }
                     } else {
                         debug!("Log missing required fields, skipping");
                     }
@@ -203,23 +319,71 @@ async fn check_for_reorgs(
     db_conn: &Connection,
     finalized: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stmt = db_conn.prepare("SELECT DISTINCT block_number, block_hash FROM transfers WHERE block_number > ?")?;
-    let rows = stmt.query_map(params![finalized - 100], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let mut stmt = db_conn.prepare(
+        "SELECT DISTINCT block_number, block_hash FROM transfers WHERE block_number > ?",
+    )?;
+    let rows = stmt.query_map(params![finalized - 100], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
     for row in rows {
         let (block_num, stored_hash): (u64, String) = row?;
         if let Some(block) = provider.get_block(block_num.into()).await? {
             if block.header.hash.to_string() != stored_hash {
-                info!("Reorg detected at block {}; deleting affected logs", block_num);
-                db_conn.execute("DELETE FROM transfers WHERE block_number = ?", params![block_num])?;
+                info!(
+                    "Reorg detected at block {}; deleting affected logs",
+                    block_num
+                );
+                db_conn.execute(
+                    "DELETE FROM transfers WHERE block_number = ?",
+                    params![block_num],
+                )?;
             }
         }
     }
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Index {
+        #[arg(value_enum, default_value = "finalized")]
+        finality: FinalityMode,
+        #[arg(long, default_value = "10")]
+        poll_interval: u64,
+        #[arg(long, num_args = 2, value_names = &["FROM", "TO"])]
+        range: Option<Vec<u64>>,
+    },
+    Query {
+        #[arg(long)]
+        tx_hash: Option<String>,
+        #[arg(long)]
+        from_addr: Option<String>,
+    },
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum FinalityMode {
     None,
     Safe,
     Finalized,
+}
+
+#[derive(Clone)]
+struct Config {
+    erc20: String,
+    rpc: String,
+}
+
+impl Config {
+    fn from_env() -> Self {
+        let erc20 = dotenv::var("ERC20_ADDRESS").expect("ERC20_ADDRESS not set");
+        let rpc = dotenv::var("RPC").expect("RPC not set");
+        Self { erc20, rpc }
+    }
 }
